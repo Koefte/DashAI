@@ -247,17 +247,13 @@ class PPOAgent:
 
 
 class DashEnv:
-    def __init__(self, client: NamedPipeClient, use_checkpoints: bool = False, checkpoint_positions: List[float] = None) -> None:
+    def __init__(self, client: NamedPipeClient) -> None:
         self.client = client
         self.prev_percent = 0.0
         self.prev_alive = True
         self.last_log = 0.0
         self.prev_obstacle_x = None
         self.speed_multiplier = 1.0
-        self.use_checkpoints = use_checkpoints
-        self.checkpoint_positions = checkpoint_positions or [0.0, 500.0, 1000.0, 1500.0, 2000.0, 2500.0]
-        self.spawn_x = 0.0
-        self.spawn_percent = 0.0
 
     def parse_state(self, line: str) -> dict:
         parts = line.strip().split()
@@ -292,17 +288,9 @@ class DashEnv:
         alive = state.get("alive", True)
         player_x = state.get("x", 0.0)
         
-        # Progress reward - adjusted for spawn position if using checkpoints
-        if self.use_checkpoints:
-            # Reward based on distance traveled from spawn point
-            delta_percent = percent - self.prev_percent
-            # Only reward forward progress
-            reward = max(0.0, delta_percent) * 10.0
-        else:
-            # Normal progress tracking
-            delta = percent - self.prev_percent
-            reward = delta * 10.0  # 10x increase: 0% to 100% = 1000 reward
-        
+        # Increase progress reward scaling significantly
+        delta = percent - self.prev_percent
+        reward = delta * 10.0  # 10x increase: 0% to 100% = 1000 reward
         done = False
         
         if self.prev_alive and not alive:
@@ -321,7 +309,7 @@ class DashEnv:
         # Update tracking
         self.prev_obstacle_x = ob_x if ob_x >= 0 else self.prev_obstacle_x
 
-        self.prev_percent = self.spawn_percent if done else percent
+        self.prev_percent = 0.0 if done else percent
         self.prev_alive = True if done else alive
         return reward, done
 
@@ -379,31 +367,9 @@ class DashEnv:
         return obs, reward, done, state
 
     def reset(self) -> np.ndarray:
-        # Request level restart
-        self.request_restart()
-        
-        # Choose spawn position if checkpoints are enabled
-        if self.use_checkpoints:
-            import random
-            self.spawn_x = random.choice(self.checkpoint_positions)
-            if DEBUG:
-                print(f"[dashai] Will spawn at x={self.spawn_x:.1f}", flush=True)
-        else:
-            self.spawn_x = 0.0
-        
-        # Wait for level to restart
-        time.sleep(0.3)  # Give game time to process restart
-        
-        # Send spawn position if using checkpoints
-        if self.use_checkpoints and self.spawn_x > 0:
-            self.set_spawn_position(self.spawn_x)
-            time.sleep(0.2)  # Give game time to process spawn
-        
-        state = self.next_state()
-        self.spawn_percent = state.get("percent", 0.0)
-        self.prev_percent = self.spawn_percent
+        self.prev_percent = 0.0
         self.prev_alive = True
-        self.prev_obstacle_x = None
+        state = self.next_state()
         return self.obs_from_state(state)
 
     def set_speed(self, multiplier: float) -> None:
@@ -418,49 +384,20 @@ class DashEnv:
         except OSError:
             if DEBUG:
                 print(f"[dashai] failed to set speed", flush=True)
-    
-    def set_spawn_position(self, x: float) -> None:
-        """Teleport player to specific x position (checkpoint spawning)"""
-        msg = f"spawn x={x}\n".encode("ascii")
-        try:
-            if self.client.pipe is not None:
-                self.client.pipe.write(msg)
-                self.client.pipe.flush()
-                if DEBUG:
-                    print(f"[dashai] set spawn position to x={x:.1f}", flush=True)
-        except OSError:
-            if DEBUG:
-                print(f"[dashai] failed to set spawn position", flush=True)
-    
-    def request_restart(self) -> None:
-        """Request level restart from game"""
-        msg = b"restart\n"
-        try:
-            if self.client.pipe is not None:
-                self.client.pipe.write(msg)
-                self.client.pipe.flush()
-                if DEBUG:
-                    print(f"[dashai] requested level restart", flush=True)
-        except OSError:
-            if DEBUG:
-                print(f"[dashai] failed to request restart", flush=True)
 
 
-def train_loop(total_steps: int = 10000, rollout: int = 128, use_speedhack: bool = True, base_speed: float = 3.0, 
-               use_checkpoints: bool = False, checkpoint_positions: List[float] = None) -> None:
-    """Train the agent with optional speedhack and checkpoint spawning support.
+def train_loop(total_steps: int = 10000, rollout: int = 128, use_speedhack: bool = True, base_speed: float = 3.0) -> None:
+    """Train the agent with optional speedhack support.
     
     Args:
         total_steps: Total training steps to run
         rollout: Number of steps before policy update (default reduced to 128 for faster feedback)
         use_speedhack: Whether to use game speedup (requires compatible version)
         base_speed: Speed multiplier to use (1.0=normal, 2.0=2x, 3.0=3x, etc.)
-        use_checkpoints: Whether to spawn at random checkpoints instead of level start
-        checkpoint_positions: List of X positions to spawn at (default: [0, 500, 1000, 1500, 2000, 2500])
     """
     client = NamedPipeClient()
     client.connect()
-    env = DashEnv(client, use_checkpoints=use_checkpoints, checkpoint_positions=checkpoint_positions)
+    env = DashEnv(client)
     agent = PPOAgent(obs_dim=10, rollout=rollout)  # Updated to 10 for has_obstacle flag
     
     # Set initial speed if speedhack is enabled
@@ -470,13 +407,6 @@ def train_loop(total_steps: int = 10000, rollout: int = 128, use_speedhack: bool
     else:
         env.set_speed(1.0)
         print(f"[dashai] Training at normal speed (1.0x)")
-    
-    # Show checkpoint configuration
-    if use_checkpoints:
-        print(f"[dashai] Checkpoint spawning enabled: {len(env.checkpoint_positions)} positions")
-        print(f"[dashai] Checkpoint X positions: {env.checkpoint_positions}")
-    else:
-        print(f"[dashai] Checkpoint spawning disabled (always start from beginning)")
     
     obs = env.reset()
     step = 0
@@ -533,20 +463,8 @@ if __name__ == "__main__":
     steps = int(os.getenv("DASHAI_STEPS", "20000"))
     use_speedhack = os.getenv("DASHAI_SPEEDHACK", "1") not in ("0", "false", "False")
     speed_multiplier = float(os.getenv("DASHAI_SPEED", "3.0"))
-    use_checkpoints = os.getenv("DASHAI_CHECKPOINTS", "0") not in ("0", "false", "False")
     
-    # Parse checkpoint positions from env var (comma-separated)
-    checkpoint_positions = None
-    if use_checkpoints:
-        checkpoint_str = os.getenv("DASHAI_CHECKPOINT_POSITIONS", "0,500,1000,1500,2000,2500")
-        try:
-            checkpoint_positions = [float(x.strip()) for x in checkpoint_str.split(",")]
-        except ValueError:
-            print(f"[dashai] Warning: Invalid checkpoint positions '{checkpoint_str}', using defaults")
-            checkpoint_positions = None
-    
-    print(f"[dashai] Starting training with rollout={rollout}, steps={steps}, speedhack={use_speedhack}, speed={speed_multiplier}x, checkpoints={use_checkpoints}")
+    print(f"[dashai] Starting training with rollout={rollout}, steps={steps}, speedhack={use_speedhack}, speed={speed_multiplier}x")
     print(f"[dashai] Device: {DEVICE}")
     
-    train_loop(total_steps=steps, rollout=rollout, use_speedhack=use_speedhack, base_speed=speed_multiplier,
-               use_checkpoints=use_checkpoints, checkpoint_positions=checkpoint_positions)
+    train_loop(total_steps=steps, rollout=rollout, use_speedhack=use_speedhack, base_speed=speed_multiplier)

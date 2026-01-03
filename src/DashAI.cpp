@@ -326,50 +326,6 @@ private:
             return;
         }
         
-        // Handle restart command
-        if (cmd.rfind("restart", 0) == 0) {
-            if (m_debug) {
-                log::debug("Restart command received");
-            }
-            // Reset level using PlayLayer's reset method
-            layer->resetLevel();
-            return;
-        }
-        
-        // Handle spawn command (checkpoint teleportation)
-        if (cmd.rfind("spawn", 0) == 0) {
-            auto player = layer->m_player1;
-            if (!player) return;
-            
-            auto pos = cmd.find("x=");
-            if (pos != std::string::npos) {
-                try {
-                    float x = std::stof(std::string(cmd.substr(pos + 2)));
-                    // Teleport player to position
-                    cocos2d::CCPoint currentPos = player->getPosition();
-                    player->setPosition({x, currentPos.y});
-                    
-                    // Reset player death state
-                    player->m_isDead = false;
-                    
-                    // Reset camera to follow player
-                    if (layer->m_objectLayer) {
-                        float cameraX = x - cocos2d::CCDirector::sharedDirector()->getWinSize().width / 2.0f;
-                        layer->m_objectLayer->setPositionX(-cameraX);
-                    }
-                    
-                    if (m_debug) {
-                        log::info("DashAI spawned player at x={:.1f}", x);
-                    }
-                } catch (...) {
-                    if (m_debug) {
-                        log::debug("Invalid spawn position value in command");
-                    }
-                }
-            }
-            return;
-        }
-        
         if (cmd.rfind("action", 0) != 0) return;
         auto player = layer->m_player1;
         if (!player) return;

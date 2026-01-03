@@ -21,16 +21,6 @@
   - `2.0` = 2x speed
   - `3.0` = 3x speed (default for faster training)
   - `5.0` = 5x speed (very fast, may be unstable)
-- Enable checkpoint spawning: `DASHAI_CHECKPOINTS=1 python dashai_agent.py` (default: disabled)
-- Set checkpoint positions: `DASHAI_CHECKPOINT_POSITIONS="0,500,1000,1500,2000,2500" python dashai_agent.py`
-
-## Checkpoint Spawning (Curriculum Learning)
-The agent can spawn at random positions in the level instead of always starting from the beginning:
-- **Benefits**: Faster learning, better exploration, practice difficult sections more frequently
-- **Enable**: Set `DASHAI_CHECKPOINTS=1`
-- **Configure positions**: Comma-separated X coordinates (e.g., `"0,500,1000,1500,2000,2500"`)
-- The agent will randomly spawn at one of these X positions on each episode reset
-- Rewards are adjusted to track progress from the spawn point
 
 ## Speedhack Support
 The mod now includes built-in speedup functionality compatible with megahack-style speedhacks:
@@ -41,7 +31,6 @@ The mod now includes built-in speedup functionality compatible with megahack-sty
 
 ### Examples
 ```bash
-# Linux/Mac (bash):
 # Train at 5x speed for ultra-fast training (50000 steps)
 DASHAI_SPEED=5.0 DASHAI_STEPS=50000 python dashai_agent.py
 
@@ -50,22 +39,6 @@ DASHAI_SPEEDHACK=0 python dashai_agent.py
 
 # Custom rollout with 2x speed
 DASHAI_SPEED=2.0 DASHAI_ROLLOUT=1024 python dashai_agent.py
-
-# Enable checkpoint spawning for curriculum learning
-DASHAI_CHECKPOINTS=1 python dashai_agent.py
-
-# Checkpoint spawning with custom positions and 5x speed
-DASHAI_CHECKPOINTS=1 DASHAI_CHECKPOINT_POSITIONS="0,1000,2000,3000" DASHAI_SPEED=5.0 python dashai_agent.py
-
-# Windows (PowerShell):
-# Train with checkpoint spawning enabled
-$env:DASHAI_CHECKPOINTS="1"; python src/dashai_agent.py
-
-# Multiple environment variables
-$env:DASHAI_CHECKPOINTS="1"; $env:DASHAI_SPEED="5.0"; python src/dashai_agent.py
-
-# Custom checkpoint positions
-$env:DASHAI_CHECKPOINTS="1"; $env:DASHAI_CHECKPOINT_POSITIONS="0,1000,2000,3000"; python src/dashai_agent.py
 ```
 
 ## Protocol expectations
@@ -74,8 +47,4 @@ $env:DASHAI_CHECKPOINTS="1"; $env:DASHAI_CHECKPOINT_POSITIONS="0,1000,2000,3000"
 - State format: `state attempt=N percent=X x=X y=X vy=X alive=0|1 ob_x=X ob_y=X ob_w=X ob_h=X speed=X`
 - Action format: `action jump=0|1 hold=0|1`
 - Speed control: `speed=X.X` (sets game speed multiplier, range: 0.1 to 10.0)
-- Restart control: `restart` (resets the level to beginning)
-- Spawn control: `spawn x=X.X` (teleports player to X position, used after restart for checkpoint training)
 - If the pipe disconnects, the mod will wait for a new client; the Python client will keep retrying if the connection drops.
-
-**Note on checkpoints**: Checkpoint spawning requires the level to be restarted first (`restart`), then the player is teleported (`spawn x=X`). This ensures proper level state initialization.
