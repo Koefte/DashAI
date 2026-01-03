@@ -1,276 +1,134 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
-#include <atomic>
-#include <chrono>
-#include <mutex>
-#include <condition_variable>
-#include <queue>
-#include <string>
-#include <string_view>
-#include <thread>
-#include <sstream>
-#include <limits>
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
+#include <ctime>
+#include <limits>
+#include <memory>
+#include <vector>
 
-#if defined(_WIN32)
-#define NOMINMAX
-#include <windows.h>
-#endif
+using namespace geode; // NOLINT
 
-using namespace geode::prelude;
 
-namespace dashai {
+struct Connection {
+    std::vector<float> fromNeurons;
+    std::vector<float> toNeurons;
+    std::vector<std::vector<float>> weights;
+    std::vector<float> biases;
+};
 
-#if defined(_WIN32)
-class PipeServer {
-public:
-    void start() {
-        bool expected = false;
-        if (!m_started.compare_exchange_strong(expected, true)) return;
-        m_thread = std::thread(&PipeServer::serverLoop, this);
-    }
-
-    void stop() {
-        m_stop.store(true);
-        m_cv.notify_all();
-        if (m_thread.joinable()) m_thread.join();
-    }
-
-    bool connected() const { return m_connected.load(); }
-
-    bool tryPop(std::string& out) {
-        std::scoped_lock lock(m_queueMutex);
-        if (m_inbox.empty()) return false;
-        out = std::move(m_inbox.front());
-        m_inbox.pop();
-        return true;
-    }
-
-    void enqueueLine(std::string_view payload) {
-        if (!connected()) return;
-        std::string line(payload);
-        line.push_back('\n');
-        {
-            std::lock_guard lock(m_outMutex);
-            m_outbox.push(std::move(line));
+class NeuralNetwork {
+    std::vector<Connection> connections;
+    public: 
+    NeuralNetwork(const int* layerShape, size_t layerCount){
+        if (!layerShape || layerCount < 2) {
+            log::error("NeuralNetwork: invalid layer shape");
+            return;
         }
-        m_cv.notify_one();
-    }
 
-private:
-    void serverLoop() {
-        while (!m_stop.load()) {
-            HANDLE pipe = CreateNamedPipeA(
-                "\\\\.\\pipe\\DashAI",
-                PIPE_ACCESS_DUPLEX,
-                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-                1,
-                4096,
-                4096,
-                0,
-                nullptr
-            );
-            if (pipe == INVALID_HANDLE_VALUE) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                continue;
-            }
-
-            BOOL ok = ConnectNamedPipe(pipe, nullptr);
-            if (!ok && GetLastError() != ERROR_PIPE_CONNECTED) {
-                CloseHandle(pipe);
-                continue;
-            }
-
-            m_pipe = pipe;
-            m_connected.store(true);
-            m_pipeAlive.store(true);
-            log::info("DashAI pipe client connected");
-            std::thread writer(&PipeServer::writeLoop, this, pipe);
-            readLoop(pipe);
-            m_pipeAlive.store(false);
-            m_cv.notify_all();
-            if (writer.joinable()) writer.join();
-            m_connected.store(false);
-            log::info("DashAI pipe client disconnected");
-            CloseHandle(pipe);
-            m_pipe = INVALID_HANDLE_VALUE;
+        connections.reserve(layerCount - 1);
+        for (size_t i = 0; i + 1 < layerCount; i++) {
+            Connection conn;
+            conn.fromNeurons.resize(static_cast<size_t>(layerShape[i]));
+            conn.toNeurons.resize(static_cast<size_t>(layerShape[i + 1]));
+            conn.biases.resize(static_cast<size_t>(layerShape[i + 1]), 0.0f);
+            conn.weights.resize(static_cast<size_t>(layerShape[i + 1]), std::vector<float>(static_cast<size_t>(layerShape[i]), 0.0f));
+            randomInitWeights(&conn.weights);
+            randomInitBiases(&conn.biases);
+            connections.push_back(std::move(conn));
         }
     }
 
-    void readLoop(HANDLE pipe) {
-        std::string buffer;
-        buffer.reserve(2048);
-        char chunk[512];
-        while (!m_stop.load()) {
-            DWORD read = 0;
-            BOOL ok = ReadFile(pipe, chunk, sizeof(chunk), &read, nullptr);
-            if (!ok || read == 0) break;
-            buffer.append(chunk, chunk + read);
-            std::size_t pos = 0;
-            while ((pos = buffer.find('\n')) != std::string::npos) {
-                std::string line = buffer.substr(0, pos);
-                buffer.erase(0, pos + 1);
-                if (!line.empty()) {
-                    std::scoped_lock lock(m_queueMutex);
-                    m_inbox.push(std::move(line));
+    std::vector<float> forward(const std::vector<float>& input) {
+        if (connections.empty()) {
+            log::error("NeuralNetwork: forward called with no connections");
+            return {};
+        }
+
+        if (input.size() != connections.front().fromNeurons.size()) {
+            log::error("NeuralNetwork: input size {} does not match first layer {}", input.size(), connections.front().fromNeurons.size());
+            return {};
+        }
+
+        std::vector<float> activations = input;
+        for (const auto& conn : connections) {
+            std::vector<float> newActivations(conn.toNeurons.size(), 0.0f);
+            for (size_t j = 0; j < conn.toNeurons.size(); j++) {
+                float sum = conn.biases[j];
+                for (size_t i = 0; i < conn.fromNeurons.size(); i++) {
+                    sum += activations[i] * conn.weights[j][i];
+                }
+                newActivations[j] = std::tanh(sum);
+            }
+            activations = newActivations;
+        }
+        return activations;
+    }
+
+    void mutate(float mutationChance) {
+        for (auto& conn : connections) {
+            for (auto& row : conn.weights) {
+                for (auto& weight : row) {
+                    if (static_cast<float>(rand()) / static_cast<float>(RAND_MAX) < mutationChance) {
+                        weight += (static_cast<float>(rand()) / static_cast<float>(RAND_MAX) - 0.5f) * 0.2f; // small random change
+                    }
+                }
+            }
+            for (auto& bias : conn.biases) {
+                if (static_cast<float>(rand()) / static_cast<float>(RAND_MAX) < mutationChance) {
+                    bias += (static_cast<float>(rand()) / static_cast<float>(RAND_MAX) - 0.5f) * 0.2f; // small random change
                 }
             }
         }
     }
 
-    void writeLoop(HANDLE pipe) {
-        while (!m_stop.load() && m_pipeAlive.load()) {
-            std::string line;
-            {
-                std::unique_lock lock(m_outMutex);
-                m_cv.wait(lock, [&]{ return m_stop.load() || !m_pipeAlive.load() || !m_outbox.empty(); });
-                if (m_stop.load() || !m_pipeAlive.load()) break;
-                line = std::move(m_outbox.front());
-                m_outbox.pop();
-            }
-            DWORD written = 0;
-            BOOL ok = WriteFile(pipe, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
-            if (!ok) break;
-            FlushFileBuffers(pipe);
+    void copyFrom(NeuralNetwork* other) {
+        if (!other) {
+            log::error("NeuralNetwork: copyFrom called with null other");
+            return;
         }
-        // clear leftover messages when pipe drops
-        std::lock_guard lock(m_outMutex);
-        std::queue<std::string> empty;
-        std::swap(m_outbox, empty);
+        connections = other->connections;
     }
 
-    std::atomic<bool> m_started{false};
-    std::atomic<bool> m_stop{false};
-    std::atomic<bool> m_connected{false};
-    std::atomic<bool> m_pipeAlive{false};
-    std::thread m_thread;
-    HANDLE m_pipe = INVALID_HANDLE_VALUE;
-    std::mutex m_queueMutex;
-    std::queue<std::string> m_inbox;
-    std::mutex m_outMutex;
-    std::condition_variable m_cv;
-    std::queue<std::string> m_outbox;
+    private:
+    void randomInitWeights(std::vector<std::vector<float>>* weights) {
+        for (auto& row : *weights) {
+            for (auto& weight : row) {
+                weight = (static_cast<float>(rand()) / RAND_MAX) * 2.f - 1.f; // Random float between -1 and 1
+            }
+        }
+    }
+
+    void randomInitBiases(std::vector<float>* biases) {
+        for (auto& bias : *biases) {
+            bias = (static_cast<float>(rand()) / RAND_MAX) * 2.f - 1.f; // Random float between -1 and 1
+        }
+    }
 };
-#else
-class PipeServer {
-public:
-    void start() {}
-    void stop() {}
-    bool connected() const { return false; }
-    bool tryPop(std::string&) { return false; }
-    void sendLine(std::string_view) {}
-};
-#endif
 
-class AIBridge {
-public:
-    static AIBridge& get() {
-        static AIBridge inst;
-        return inst;
-    }
 
-    void start() { m_pipe.start(); }
-    void shutdown() { m_pipe.stop(); }
+static int defaultLayerShape[] = {6,16,4};
+static constexpr size_t defaultLayerCount = sizeof(defaultLayerShape) / sizeof(defaultLayerShape[0]);
+static const int POPULATION_SIZE = 50;
+static const int INJECT_COUNT = 5;
+static const float MUTATION_RATE = 0.1f; // 10% mutation rate
+static constexpr float ACTION_DURATIONS[4] = {0.0f, 0.08f, 0.18f, 0.35f};
 
-    void onLevelStart(PlayLayer* layer) {
-        m_layer.store(layer);
-        m_attempt.fetch_add(1);
-        m_lastPercent = 0.0f;
-        
-        // Create stats label if it doesn't exist
-        if (!m_statsLabel) {
-            m_statsLabel = cocos2d::CCLabelBMFont::create("Best: 0.0% | Avg: 0.0%", "bigFont.fnt");
-            m_statsLabel->setScale(0.5f);
-            m_statsLabel->setZOrder(1000);
-            m_statsLabel->retain();
-        }
-        
-        // Position label at top of screen
-        auto winSize = cocos2d::CCDirector::sharedDirector()->getWinSize();
-        m_statsLabel->setPosition({winSize.width / 2, winSize.height - 20.f});
-        layer->addChild(m_statsLabel);
-    }
+struct $modify(DashAIPlayLayer, PlayLayer) {
 
-    void onLevelStop(PlayLayer* layer) {
-        // Track this run's percentage
-        if (m_lastPercent > 0.0f) {
-            m_runPercents.push_back(m_lastPercent);
-            // Keep only last 100 runs
-            if (m_runPercents.size() > 100) {
-                m_runPercents.erase(m_runPercents.begin());
-            }
-            // Update best
-            if (m_lastPercent > m_bestPercent) {
-                m_bestPercent = m_lastPercent;
-            }
-        }
-        
-        // Remove label from layer
-        if (m_statsLabel && m_statsLabel->getParent() == layer) {
-            m_statsLabel->removeFromParent();
-        }
-        
-        PlayLayer* expected = layer;
-        m_layer.compare_exchange_strong(expected, nullptr);
-    }
-
-    void setSpeedMultiplier(float multiplier) {
-        m_speedMultiplier = std::max(0.1f, std::min(10.0f, multiplier));
-        auto scheduler = cocos2d::CCDirector::sharedDirector()->getScheduler();
-        if (scheduler) {
-            scheduler->setTimeScale(m_speedMultiplier);
-        }
-        if (m_debug) {
-            log::info("DashAI speed multiplier set to {:.2f}x", m_speedMultiplier);
-        }
-    }
-
-    float getSpeedMultiplier() const {
-        return m_speedMultiplier;
-    }
-
-    void onPostUpdate(PlayLayer* layer, float) {
-        if (layer != m_layer.load()) return;
-        handleCommands(layer);
-        maybeSendState(layer);
-    }
-
-private:
-    AIBridge() {
-        m_debug = std::getenv("DASHAI_DEBUG") != nullptr;
-        if (m_debug) {
-            log::info("DashAI debug logging enabled (env DASHAI_DEBUG)");
-        }
-    }
-    ~AIBridge() { shutdown(); }
-
-    void handleCommands(PlayLayer* layer) {
-        std::string cmd;
-        while (m_pipe.tryPop(cmd)) {
-            applyCommand(layer, cmd);
-        }
-    }
-
-    bool parseFlag(std::string_view cmd, std::string_view key) {
-        auto pos = cmd.find(key);
-        if (pos == std::string::npos) return false;
-        pos += key.size();
-        if (pos >= cmd.size() || cmd[pos] != '=') return false;
-        pos += 1;
-        if (pos >= cmd.size()) return false;
-        char c = static_cast<char>(cmd[pos]);
-        return c == '1' || c == 't' || c == 'T' || c == 'y' || c == 'Y';
-    }
-
-    struct ObstacleInfo {
-        float x = -1.f;
-        float y = -1.f;
-        float w = -1.f;
-        float h = -1.f;
-        bool found = false;
+    struct Fields{
+        std::unique_ptr<NeuralNetwork> m_populationNetworks[POPULATION_SIZE];
+        std::pair<NeuralNetwork*,float> distances[POPULATION_SIZE];
+        float grades[POPULATION_SIZE] = {0.0f};
+        int currentNetworkIdx = 0;
+        bool isHolding = false;
+        float holdTimer = 0.0f;
+        float holdDuration = 0.0f;
+        int jumpCount = 0;
     };
 
-    bool isObstacle(GameObject* obj) {
+     bool isObstacle(GameObject* obj) {
         if (!obj) return false;
         auto type = obj->getType();
         switch (type) {
@@ -286,9 +144,9 @@ private:
         }
     }
 
-    ObstacleInfo nearestObstacle(PlayLayer* layer, const cocos2d::CCPoint& playerPos) {
-        ObstacleInfo info;
-        if (!layer || !layer->m_objects) return info;
+    GameObject* nearestObstacle(PlayLayer* layer, const cocos2d::CCPoint& playerPos) {
+        if (!layer || !layer->m_objects) return nullptr;
+        GameObject* object = nullptr;
         float bestDx = std::numeric_limits<float>::infinity();
         cocos2d::CCObject* raw = nullptr;
         CCARRAY_FOREACH(layer->m_objects, raw) {
@@ -300,152 +158,170 @@ private:
             if (dx < 0.f) continue;
             if (dx >= bestDx) continue;
             bestDx = dx;
-            info.x = rect.origin.x;
-            info.y = rect.origin.y;
-            info.w = rect.size.width;
-            info.h = rect.size.height;
-            info.found = true;
+            object = obj;
+
         }
-        return info;
+        return object;
     }
 
-    void applyCommand(PlayLayer* layer, std::string_view cmd) {
-        // Handle speed command
-        if (cmd.rfind("speed", 0) == 0) {
-            auto pos = cmd.find("=");
-            if (pos != std::string::npos) {
-                try {
-                    float speed = std::stof(std::string(cmd.substr(pos + 1)));
-                    setSpeedMultiplier(speed);
-                } catch (...) {
-                    if (m_debug) {
-                        log::debug("Invalid speed value in command");
-                    }
-                }
-            }
-            return;
+    int argmax(const std::vector<float>& v) {
+        int best = 0;
+        for (int i = 1; i < v.size(); i++) {
+            if (v[i] > v[best]) best = i;
         }
-        
-        if (cmd.rfind("action", 0) != 0) return;
-        auto player = layer->m_player1;
-        if (!player) return;
-        bool jump = parseFlag(cmd, "jump");
-        bool hold = parseFlag(cmd, "hold");
-        if (m_debug) {
-            log::debug("cmd action jump={} hold={}", jump, hold);
-        }
-        if (jump || hold) {
-            player->pushButton(PlayerButton::Jump);
-        } else {
-            player->releaseButton(PlayerButton::Jump);
-        }
+        return best;
     }
 
-    void maybeSendState(PlayLayer* layer) {
-        if (!m_pipe.connected()) return;
-        auto now = std::chrono::steady_clock::now();
-        if (now - m_lastSend < std::chrono::milliseconds(33)) return;
-        m_lastSend = now;
-
-        auto player = layer->m_player1;
-        if (!player) return;
-
-        cocos2d::CCPoint pos = player->getPosition();
-        float vy = player->m_yVelocity;
-        float percent = layer->getCurrentPercent();
-        bool alive = !player->m_isDead;
-        auto obstacle = nearestObstacle(layer, pos);
-        
-        // Update last percent for tracking
-        m_lastPercent = percent;
-        
-        // Update best percent
-        if (percent > m_bestPercent) {
-            m_bestPercent = percent;
-        }
-        
-        // Calculate average percentage
-        float avgPercent = 0.0f;
-        if (!m_runPercents.empty()) {
-            float sum = 0.0f;
-            for (float p : m_runPercents) {
-                sum += p;
-            }
-            avgPercent = sum / m_runPercents.size();
-        }
-        
-        // Update stats label
-        if (m_statsLabel) {
-            char labelText[128];
-            snprintf(labelText, sizeof(labelText), "Best: %.1f%% | Avg: %.1f%% | Runs: %zu", 
-                     m_bestPercent, avgPercent, m_runPercents.size());
-            m_statsLabel->setString(labelText);
+    bool init(GJGameLevel* level,bool useReplay,bool dontCreateObjects) {
+        if (!PlayLayer::init(level,useReplay,dontCreateObjects)) {
+            log::error("DashAI: failed to initialize PlayLayer");
+            return false;
         }
 
-        std::ostringstream oss;
-        oss.setf(std::ios::fixed);
-        oss.precision(3);
-        oss << "state "
-            << "attempt=" << m_attempt.load() << ' '
-            << "percent=" << percent << ' '
-            << "x=" << pos.x << ' '
-            << "y=" << pos.y << ' '
-            << "vy=" << vy << ' '
-            << "alive=" << (alive ? 1 : 0) << ' '
-            << "ob_x=" << obstacle.x << ' '
-            << "ob_y=" << obstacle.y << ' '
-            << "ob_w=" << obstacle.w << ' '
-            << "ob_h=" << obstacle.h << ' '
-            << "speed=" << m_speedMultiplier;
-        m_pipe.enqueueLine(oss.str());
-
-        if (m_debug) {
-            auto nowDebug = std::chrono::steady_clock::now();
-            if (nowDebug - m_lastDebugLog > std::chrono::milliseconds(1000)) {
-                m_lastDebugLog = nowDebug;
-                log::debug("state pct={:.2f} x={:.1f} y={:.1f} vy={:.2f} ob=({}, {}, {}, {}) alive={}",
-                    percent, pos.x, pos.y, vy,
-                    obstacle.x, obstacle.y, obstacle.w, obstacle.h,
-                    alive);
-            }
+        static bool seeded = false;
+        if (!seeded) {
+            srand(static_cast<unsigned>(time(nullptr)));
+            seeded = true;
         }
-    }
 
-    PipeServer m_pipe;
-    std::atomic<PlayLayer*> m_layer{nullptr};
-    std::atomic<int> m_attempt{0};
-    std::chrono::steady_clock::time_point m_lastSend{};
-    bool m_debug = false;
-    std::chrono::steady_clock::time_point m_lastDebugLog{};
-    float m_speedMultiplier = 1.0f;
-    float m_bestPercent = 0.0f;
-    float m_lastPercent = 0.0f;
-    std::vector<float> m_runPercents;
-    cocos2d::CCLabelBMFont* m_statsLabel = nullptr;
-};
+        for(int i = 0; i < POPULATION_SIZE; i++) {
+            m_fields->m_populationNetworks[i] = std::make_unique<NeuralNetwork>(defaultLayerShape, defaultLayerCount);
+        }
 
-} // namespace dashai
-
-$on_mod(Loaded) {
-    dashai::AIBridge::get().start();
-    log::info("DashAI pipe server ready at \\\\.\\\\pipe\\\\DashAI");
-}
-
-class $modify(DashAIPlayLayer, PlayLayer) {
-public:
-    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
-        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-        dashai::AIBridge::get().onLevelStart(this);
+        
         return true;
     }
 
-    void onExit() {
-        dashai::AIBridge::get().onLevelStop(this);
-        PlayLayer::onExit();
+    std::vector<int> getTopElitesIndices(const float* grades, size_t eliteCount) {
+        std::vector<std::pair<float, int>> gradeIdxPairs;
+        gradeIdxPairs.reserve(POPULATION_SIZE);
+        for (int i = 0; i < POPULATION_SIZE; i++) {
+            gradeIdxPairs.emplace_back(grades[i], i);
+        }
+        std::sort(gradeIdxPairs.begin(), gradeIdxPairs.end(), std::greater<>());
+        std::vector<int> eliteIndices;
+        eliteIndices.reserve(eliteCount);
+        for (size_t i = 0; i < eliteCount && i < gradeIdxPairs.size(); i++) {
+            eliteIndices.push_back(gradeIdxPairs[i].second);
+        }
+        return eliteIndices;
+    }
+
+    void createNextGeneration(const std::vector<int>& eliteIndices) {
+        if (eliteIndices.empty()) {
+            log::error("DashAI: no elites available for next generation");
+            return;
+        }
+
+        std::vector<NeuralNetwork> eliteCopies;
+        eliteCopies.reserve(eliteIndices.size());
+        for (size_t i = 0; i < eliteIndices.size(); i++) {
+            auto* elitePtr = m_fields->m_populationNetworks[eliteIndices[i]].get();
+            if (elitePtr) {
+                eliteCopies.push_back(*elitePtr);
+            }
+        }
+
+        if (eliteCopies.empty()) {
+            log::error("DashAI: failed to clone elites for next generation");
+            return;
+        }
+
+        // Keep best elite unmutated in slot 0.
+        m_fields->m_populationNetworks[0] = std::make_unique<NeuralNetwork>(defaultLayerShape, defaultLayerCount);
+        m_fields->m_populationNetworks[0]->copyFrom(&eliteCopies[0]);
+
+        // Fill the rest with mutated copies cycling through elites.
+        for (int i = 1; i < POPULATION_SIZE; i++) {
+            size_t parentIdx = static_cast<size_t>(i) % eliteCopies.size();
+            m_fields->m_populationNetworks[i] = std::make_unique<NeuralNetwork>(defaultLayerShape, defaultLayerCount);
+            if(POPULATION_SIZE - i > INJECT_COUNT) {
+                m_fields->m_populationNetworks[i]->copyFrom(&eliteCopies[parentIdx]);
+                m_fields->m_populationNetworks[i]->mutate(MUTATION_RATE); // Mutate with 10% chance
+            }
+        }
+    }
+
+    float getBestDistance(const std::pair<NeuralNetwork*,float>* distances, size_t count) {
+        float bestDistance = 0.0f;
+        for (size_t i = 0; i < count; i++) {
+            if (distances[i].second > bestDistance) {
+                bestDistance = distances[i].second;
+            }
+        }
+        return bestDistance;
+    }
+
+    float getAverageDistance(const std::pair<NeuralNetwork*,float>* distances, size_t count) {
+        float totalDistance = 0.0f;
+        for (size_t i = 0; i < count; i++) {
+            totalDistance += distances[i].second;
+        }
+        return totalDistance / static_cast<float>(count);
     }
 
     void postUpdate(float dt) {
-        dashai::AIBridge::get().onPostUpdate(this, dt);
         PlayLayer::postUpdate(dt);
+        std::vector<float> gameData{};
+        GameObject* nearestObs = nearestObstacle(this, this->m_player1->getPosition());
+        if(!nearestObs) {
+            log::error("DashAI: no nearest obstacle found");
+            return;
+        }
+        gameData.resize(defaultLayerShape[0], 0.0f);
+        gameData[0] = this->m_player1->getPosition().y / 300.0f;
+        gameData[1] = this->m_player1->m_yVelocity / 60.0f;
+        gameData[2] = nearestObs->getPosition().x / 300.0f;
+        gameData[3] = nearestObs->m_height / 100.0f;
+        gameData[4] = m_player1->m_isOnGround ? 1.0f : 0.0f;
+        gameData[5] = m_player1->m_isShip ? 1.0f : 0.0f;
+        auto output = m_fields->m_populationNetworks[m_fields->currentNetworkIdx]->forward(gameData);
+        if (output.empty()) {
+            return;
+        }
+        auto action = argmax(output);
+
+        if (action == 0) {
+            if (m_fields->isHolding) {
+                m_player1->releaseButton(PlayerButton::Jump);
+                m_fields->isHolding = false;
+                m_fields->holdTimer = 0.0f;
+                m_fields->holdDuration = 0.0f;
+            }
+        } else {
+            if (!m_fields->isHolding) {
+                size_t idx = static_cast<size_t>(std::min(action, 3));
+                m_fields->holdDuration = ACTION_DURATIONS[idx];
+                m_fields->holdTimer = 0.0f;
+                m_player1->pushButton(PlayerButton::Jump);
+                m_fields->isHolding = true;
+                m_fields->jumpCount++;
+            }
+        }
+
+        if (m_fields->isHolding) {
+            m_fields->holdTimer += dt;
+            if (m_fields->holdTimer >= m_fields->holdDuration) {
+                m_player1->releaseButton(PlayerButton::Jump);
+                m_fields->isHolding = false;
+                m_fields->holdTimer = 0.0f;
+                m_fields->holdDuration = 0.0f;
+            }
+        }
+        if(m_player1->m_isDead) {
+            m_fields->grades[m_fields->currentNetworkIdx] = this->m_player1->getPosition().x - m_fields->jumpCount; // Use distance traveled as grade for now
+            m_fields->distances[m_fields->currentNetworkIdx] = {m_fields->m_populationNetworks[m_fields->currentNetworkIdx].get(), (this->m_player1->getPosition().x / this->m_levelLength) * 100.0f};
+            m_fields->currentNetworkIdx = (m_fields->currentNetworkIdx + 1) % POPULATION_SIZE;
+            if(m_fields->currentNetworkIdx == 0) {
+                m_fields->jumpCount = 0;
+                float bestDistance = getBestDistance(m_fields->distances, POPULATION_SIZE);
+                float avgDistance = getAverageDistance(m_fields->distances, POPULATION_SIZE);
+                log::info("DashAI: Generation completed. Best Distance: {:.2f}, Average Distance: {:.2f}", bestDistance, avgDistance);
+                auto elitesIdx = getTopElitesIndices(m_fields->grades, 5);
+                createNextGeneration(elitesIdx);
+                log::info("DashAI: Created next generation of neural networks");
+            }
+            this->resetLevel();
+        }
     }
-};
+}; 
